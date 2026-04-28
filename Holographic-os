@@ -14,6 +14,7 @@ class HolographicOS_FullStandalone:
             'etaG': 0.8, 'etaw': 0.5, 'A': 1.0, 't0': 30.0, 'sigma': 10.0
         }
         
+        # 4×4 Transition Operator T^ 
         self.T = np.array([
             [0.95, 0.00, 0.00, 0.00],
             [0.35, 0.88, 0.00, 0.00],
@@ -23,15 +24,172 @@ class HolographicOS_FullStandalone:
         
         self.eig_history = []
         self.betti_history = []
-        self.cumulative_complexity = 0.0
-
-    # [All methods from the last version: get_local_params, fisher_rao_gradient_step, 
-    # local_rhs, evolve_T, simulate, plot_eigenvalues, physics_dashboard]
-    # (Paste the full class from my previous response here - it's too long for this box but you already have it)
+        self.cumulative_complexity = 0.0  # For Lloyd Bound
+    
+    def fisher_rao_gradient_step(self, actions):
+        """Fisher-Rao inspired gradient descent to minimize action variance (Garbage Collector)"""
+        mean_action = np.mean(actions)
+        variance = np.var(actions)
+        
+        # Gradient flow direction: push parameters to reduce variance
+        grad_factor = 0.05 * variance / (mean_action + 1e-8)  # Learning rate scaled by variance
+        
+        # Update base parameters toward uniformity
+        self.p_base['kappa0'] = max(0.01, self.p_base['kappa0'] * (1 - 0.3 * grad_factor))
+        self.p_base['etaG'] = max(0.1, self.p_base['etaG'] * (1 + 0.2 * grad_factor))
+        self.p_base['etaw'] = max(0.1, self.p_base['etaw'] * (1 - 0.15 * grad_factor))
+        
+        return variance
+    
+    def get_local_params(self, cycle_actions=None):
+        """Modified: Fisher-Rao variational minimization of action variance across cycles"""
+        if cycle_actions is not None and len(cycle_actions) > 1:
+            self.fisher_rao_gradient_step(cycle_actions)
+        
+        debt_factor = 1.0 / (1.0 + 4.0 * self.ledger['D'])
+        horizon_factor = np.sqrt(self.L)
+        
+        return {
+            'kappa': self.p_base['kappa0'] * debt_factor * horizon_factor,
+            'gamma': self.p_base['gamma0'] * (1.0 + 3.0 * self.ledger['D']),
+            'etaG': self.p_base['etaG'] * (1.0 + 1.5 * self.ledger['D']),
+            'etaw': self.p_base['etaw'] * (1.0 + 0.8 * self.ledger['D']),
+            'Gamma0': self.p_base['Gamma0'],
+            'omega0': self.p_base['omega0'],
+            'A': self.p_base['A'],
+            't0': self.p_base['t0'],
+            'sigma': self.p_base['sigma']
+        }
+    
+    def local_rhs(self, t, y, params):
+        x, v, c = y
+        F = params['A'] * np.exp(-((t - params['t0'])**2) / (2 * params['sigma']**2))
+        dc = params['kappa'] * (x**2) * (1 - c) - params['gamma'] * c
+        Gamma = params['Gamma0'] * (1 + params['etaG'] * c)
+        omega = params['omega0'] * (1 + params['etaw'] * c)
+        dx = v
+        dv = -Gamma * v - (omega**2) * x + F
+        return [dx, dv, dc]
+    
+    def evolve_T(self, c):
+        T_new = self.T.copy()
+        T_new[1,0] *= (1 + 0.6 * c)
+        T_new[2,0] *= (1 + 0.3 * c)
+        T_new[2,1] *= (1 + 0.4 * c)
+        T_new[0,0] = max(0.75, T_new[0,0] - 0.08 * c)
+        T_new[1,1] = min(0.98, T_new[1,1] * (1 - 0.02 * c))
+        
+        for i in range(4):
+            row_sum = np.sum(T_new[i])
+            if row_sum > 1e-8:
+                T_new[i] /= (row_sum * 0.98)
+        
+        self.T = T_new
+        eigs = np.sort(np.real(np.linalg.eigvals(T_new)))[::-1]
+        self.eig_history.append(eigs)
+        
+        stable = np.sum(eigs > 0.85)
+        loops = int(8 * np.sum((eigs > 0.4) & (eigs < 0.9)))
+        betti = {'b0': int(stable), 'b1': loops, 'proton_like': eigs[0]}
+        self.betti_history.append(betti)
+        return eigs
+    
+    def simulate(self, t_span=(0, 150), n_steps=400):
+        t_eval = np.linspace(t_span[0], t_span[1], n_steps)
+        c_local_all = np.zeros((self.n_cycles, n_steps))
+        action_per_cycle = np.zeros(self.n_cycles)  # For Fisher-Rao
+        
+        # Multi-scale NCCR with Fisher-Rao adjustment
+        for i in range(self.n_cycles):
+            params = self.get_local_params()  # Initial params
+            y0 = np.array([0.0, 0.0, 0.05 + 0.015 * np.random.randn()])
+            sol = solve_ivp(
+                fun=lambda t, y: self.local_rhs(t, y, params),
+                t_span=t_span,
+                y0=y0,
+                t_eval=t_eval,
+                method='RK45',
+                rtol=1e-6,
+                atol=1e-8
+            )
+            c_local_all[i] = sol.y[2]
+            # Action proxy = integrated x² (work)
+            action_per_cycle[i] = np.trapezoid(sol.y[0]**2, t_eval)
+        
+        # Fisher-Rao gradient step using current cycle actions
+        self.fisher_rao_gradient_step(action_per_cycle)
+        
+        c_avg = np.mean(c_local_all, axis=0)
+        
+        # Evolve T^
+        self.eig_history = []
+        self.betti_history = []
+        for idx in range(len(t_eval)):
+            self.evolve_T(c_avg[idx])
+        
+        # Ledger + Horizon
+        dt = t_eval[1] - t_eval[0]
+        dD = -0.65 * c_avg
+        D_history = self.ledger['D'] + np.cumsum(dD * dt)
+        self.ledger['D'] = np.clip(D_history[-1], 0.0, 0.95)
+        
+        self.ledger['A'] = np.trapezoid(c_avg * np.mean(c_local_all, axis=0)**2, t_eval) * 12.0
+        
+        debt_service = np.mean(-dD)
+        self.L += 0.012 * debt_service * (t_span[1] - t_span[0]) + 0.008 * self.ledger['D']
+        
+        self.ledger['Omega'] += 0.018 * self.L * (self.ledger['A'] - 0.7 * self.ledger['D'])
+        
+        # === Lloyd Bound: Cumulative Complexity ===
+        self.cumulative_complexity += self.ledger['A'] * (t_span[1] - t_span[0])
+        lloyd_limit = 1e6   # Scaled proxy for ~214 Gyr (tune as needed)
+        
+        if self.cumulative_complexity > lloyd_limit:
+            print(f"\n!!! LLOYD BOUND REACHED at t ≈ {t_eval[-1]:.1f} (214 Gyr equivalent) !!!")
+            self.physics_dashboard({'L_final': self.L, 'ledger_final': self.ledger})
+            sys.exit("Universal Lifespan Reached — Recursive Closure Initiated")
+        
+        return {
+            't': t_eval,
+            'c_avg': c_avg,
+            'ledger_final': self.ledger.copy(),
+            'L_final': self.L,
+            'T_final': self.T.copy(),
+            'eig_history': np.array(self.eig_history),
+            'betti_final': self.betti_history[-1] if self.betti_history else {}
+        }
+    
+    def plot_eigenvalues(self, result):
+        t = result['t']
+        eigs = result['eig_history']
+        plt.figure(figsize=(12, 6))
+        for i in range(4):
+            plt.plot(t, eigs[:, i], linewidth=2.5, label=f'λ_{i}')
+        plt.axhline(1.0, color='gray', linestyle='--', alpha=0.7)
+        plt.xlabel('Time (cosmological scaling)')
+        plt.ylabel('Eigenvalues of T^')
+        plt.title('DTP — Eigenvalue Flow + Fisher-Rao Optimization')
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+    
+    def physics_dashboard(self, result):
+        print("\n" + "="*70)
+        print("HOLOGRAPHIC INFORMATION DYNAMICS OS — PHYSICS DASHBOARD")
+        print("="*70)
+        print(f"Horizon Scale L          : {result['L_final']:.4f}")
+        print(f"Structural Debt D        : {result['ledger_final']['D']:.4f}")
+        print(f"Available Resources Ω    : {result['ledger_final']['Omega']:.4f}")
+        print(f"Cumulative Complexity I  : {self.cumulative_complexity:.2e}")
+        print(f"Final T^ Eigenvalues     : {np.round(result.get('eig_history', np.zeros((1,4)))[-1], 5)}")
+        print(f"Persistent Homology      : b0={result['betti_final'].get('b0',0)}, b1={result['betti_final'].get('b1',0)}")
+        print(f"Projected Shutdown       : ~214 Gyr (Lloyd Bound)")
+        print("="*70)
 
 # ====================== RUN ======================
 if __name__ == "__main__":
-    print("🚀 Initializing Holographic Information Dynamics OS v1.0.0")
+    print("Initializing Holographic OS with Fisher-Rao + Lloyd Bound...")
     model = HolographicOS_FullStandalone(n_cycles=20)
     result = model.simulate(t_span=(0, 180), n_steps=300)
     model.physics_dashboard(result)
